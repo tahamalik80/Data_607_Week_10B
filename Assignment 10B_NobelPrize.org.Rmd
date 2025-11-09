@@ -1,0 +1,423 @@
+```{r, echo=FALSE}
+# This file is a single R Markdown document; open and knit in RStudio or use rmarkdown::render()
+```
+
+---
+title: "Assignment 10B — NobelPrize.org: Four Questions with the API"
+author: "Taha Malik"
+date: "2025-11-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: flatly
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=TRUE}
+# Setup: load libraries, helper functions and options
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(knitr)
+library(purrr)
+library(stringr)
+library(tibble)
+
+options(warn = -1)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Toggle this to TRUE to use a cached JSON/RDS file when available (recommended for reproducible runs)
+use_cache <- FALSE
+cache_filename_json <- "laureates_cached_v2.json"
+cache_filename_rds  <- "nobel_laureates_cached.rds"
+processed_rds       <- "nobel_processed.rds"
+
+# Helper operator: fallback if NULL
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# Safely pluck and return character (works with nested lists; supply path elements)
+safe_pluck_chr <- function(x, ..., .default = NA_character_) {
+  val <- purrr::pluck(x, ..., .default = .default)
+  if (is.null(val)) .default else as.character(val)
+}
+
+# Return first non-empty string among arguments (scalar usage)
+coalesce_str <- function(...) {
+  vals <- list(...)
+  for (v in vals) {
+    if (!is.null(v) && !is.na(v) && nzchar(as.character(v))) return(as.character(v))
+  }
+  return(NA_character_)
+}
+
+# Vectorized country normalizer (simple mapping; extend as needed)
+country_normalize <- function(country) {
+  # Accept vectors
+  country <- as.character(country)
+  country[country == "NA"] <- NA_character_
+  country[is.na(country)] <- NA_character_
+  # Trim and unify whitespace
+  c_out <- str_trim(country)
+  c_out <- ifelse(is.na(c_out) | c_out == "", NA_character_, c_out)
+  # Common replacements (extend for historical names as needed)
+  c_out <- str_replace_all(c_out, regex("United States of America|United States|U\\.S\\.A\\.|U\\.S\\.A|USA", ignore_case = TRUE), "United States")
+  c_out <- str_replace_all(c_out, regex("\\bUK\\b", ignore_case = TRUE), "United Kingdom")
+  c_out <- str_replace_all(c_out, regex("The Netherlands", ignore_case = TRUE), "Netherlands")
+  c_out <- str_replace_all(c_out, regex("Republic of Korea|Korea, South", ignore_case = TRUE), "South Korea")
+  c_out <- str_replace_all(c_out, regex("Korea, North", ignore_case = TRUE), "North Korea")
+  c_out <- str_replace_all(c_out, regex("Russian Federation|Russia \\(USSR\\)|Russian Federation", ignore_case = TRUE), "Russia")
+  c_out <- str_replace_all(c_out, regex("Czechia", ignore_case = TRUE), "Czech Republic")
+  c_out <- str_replace_all(c_out, regex("Soviet Union", ignore_case = TRUE), "USSR")
+  c_out <- str_replace_all(c_out, "\\s+", " ")
+  c_out <- ifelse(nzchar(c_out), c_out, NA_character_)
+  return(c_out)
+}
+```
+
+Description of the setup chunk:
+- Purpose: load the R packages used throughout the analysis and define small helper functions used to extract and normalize fields from the nested JSON returned by the Nobel API.
+- Key items defined:
+  - use_cache and cache filenames: toggles and file names for reproducible runs using local cache files.
+  - safe_pluck_chr(): safely extracts nested values (returns NA when absent) and coerces to character.
+  - coalesce_str(): scalar fallback for selecting the first non-empty value among candidates.
+  - country_normalize(): vectorized normalizer to standardize common country name variants.
+- Expected result: the session has required packages and helper functions available; no visible output aside from any package messages.
+
+---
+
+# 1 — Fetching the data (v2 preferred; v1 fallback and caching)
+
+```{r fetch-data}
+message("Fetching laureates from NobelPrize API (v2 preferred).")
+
+if (use_cache && file.exists(processed_rds)) {
+  message("Loading processed RDS: ", processed_rds)
+  processed <- readRDS(processed_rds)
+  laureates_list <- processed$laureates_list
+  message("✅ Loaded laureates from processed RDS. Objects: ", length(laureates_list))
+} else if (use_cache && file.exists(cache_filename_rds)) {
+  message("Loading cached RDS: ", cache_filename_rds)
+  cache_all <- readRDS(cache_filename_rds)
+  laureates_list <- cache_all$laureates_list
+  message("✅ Loaded laureates from cached RDS. Objects: ", length(laureates_list))
+} else if (use_cache && file.exists(cache_filename_json)) {
+  message("Loading cached JSON: ", cache_filename_json)
+  la <- jsonlite::fromJSON(cache_filename_json, simplifyVector = FALSE)
+  laureates_list <- if (is.list(la) && "laureates" %in% names(la)) la$laureates else la
+  message("✅ Loaded laureates from cached JSON. Objects: ", length(laureates_list))
+} else {
+  url_v2 <- "https://api.nobelprize.org/2.1/laureates"
+  ua <- user_agent("MuahMuahXOXO - ASU CHM116 assignment - contact:(your-email@example.com)")
+  res <- tryCatch({
+    httr::GET(url_v2, ua, timeout(30))
+  }, error = function(e) {
+    message("GET failed: ", e$message)
+    return(NULL)
+  })
+
+  if (is.null(res)) stop("Unable to access API (network/timeout).")
+
+  if (httr::status_code(res) == 429) {
+    stop("API rate limit (429). Try again later or set use_cache <- TRUE and provide cached JSON/RDS.")
+  }
+
+  if (httr::status_code(res) >= 300) {
+    message("v2 returned HTTP ", httr::status_code(res), " — trying v1 fallback.")
+    url_v1 <- "https://api.nobelprize.org/v1/laureate.json"
+    laureates_raw_v1 <- tryCatch(jsonlite::fromJSON(url_v1, simplifyVector = FALSE), error = function(e) NULL)
+    if (!is.null(laureates_raw_v1) && "laureates" %in% names(laureates_raw_v1)) {
+      laureates_list <- laureates_raw_v1$laureates
+    } else {
+      stop("Failed to fetch laureates data from both v2 and v1 APIs.")
+    }
+  } else {
+    body <- httr::content(res, as = "parsed", simplifyVector = FALSE)
+    if ("laureates" %in% names(body)) {
+      laureates_list <- body$laureates
+    } else {
+      stop("Unexpected v2 response structure; cannot find 'laureates' field.")
+    }
+  }
+
+  message("Laureates fetched: ", length(laureates_list))
+
+  # Optionally write caches for reproducibility (uncomment to persist)
+  # jsonlite::write_json(laureates_list, cache_filename_json, pretty = TRUE, auto_unbox = TRUE)
+  # saveRDS(list(laureates_list = laureates_list), cache_filename_rds)
+}
+```
+
+Description of the fetch-data chunk (detailed):
+- Purpose: obtain the laureates JSON payload. The preferred source is the v2 laureates endpoint which returns rich nested information (including nobelPrizes per laureate). If a local cache is available and use_cache is TRUE, the chunk loads from the cache to ensure reproducible outputs.
+- Behavior and logic:
+  - If processed_rds / cache files exist and use_cache is TRUE, load them to avoid network calls.
+  - Otherwise perform a GET against the v2 endpoint with a polite user-agent and a 30-second timeout.
+  - If the v2 response indicates rate limiting (HTTP 429) or other HTTP errors, the chunk reports the condition and attempts a fallback to the legacy v1 laureate endpoint when appropriate.
+  - The returned content is parsed as a list; the code expects a top-level "laureates" field in v2.
+- Expected outputs and checks:
+  - Messages printed describing whether data was loaded from cache or fetched live, and the number of laureate objects fetched (e.g., "Laureates fetched: 1000").
+  - If the API is unreachable or responses are unexpected, a clear error is thrown.
+- How to use caches:
+  - After a successful run you can uncomment the jsonlite::write_json and saveRDS lines to persist the fetched JSON or RDS for later reproducible runs.
+
+---
+
+# 2 — Prepare tidy data frames (laureates_tidy and prizes_df2)
+
+```{r prepare-data}
+# laureates_tidy: one row per laureate
+laureates_tidy <- purrr::map_dfr(laureates_list, function(x) {
+  tibble(
+    id = as.character(safe_pluck_chr(x, "id")),
+    firstname = coalesce_str(safe_pluck_chr(x, "givenName", "en"), safe_pluck_chr(x, "givenName")),
+    surname = coalesce_str(safe_pluck_chr(x, "familyName", "en"), safe_pluck_chr(x, "familyName")),
+    knownName = coalesce_str(safe_pluck_chr(x, "knownName", "en"), safe_pluck_chr(x, "knownName")),
+    fullName = coalesce_str(safe_pluck_chr(x, "fullName", "en"), safe_pluck_chr(x, "fullName")),
+    birth_date = coalesce_str(safe_pluck_chr(x, "birth", "date"), safe_pluck_chr(x, "born")),
+    birth_place_country = coalesce_str(
+      safe_pluck_chr(x, "birth", "place", "country", "en"),
+      safe_pluck_chr(x, "birth", "place", "country"),
+      safe_pluck_chr(x, "bornCountry")
+    ),
+    birth_place_city = coalesce_str(
+      safe_pluck_chr(x, "birth", "place", "city", "en"),
+      safe_pluck_chr(x, "birth", "place", "city"),
+      safe_pluck_chr(x, "bornCity")
+    ),
+    gender = safe_pluck_chr(x, "gender")
+  )
+}) %>%
+  mutate(birth_place_country_norm = country_normalize(birth_place_country))
+
+# prizes_df2: iterate each laureate's nobelPrizes (v2) or prizes (v1)
+prizes_df2 <- purrr::imap_dfr(laureates_list, function(laureate, idx) {
+  laureate_id <- as.character(safe_pluck_chr(laureate, "id"))
+  prizes_arr <- purrr::pluck(laureate, "nobelPrizes", .default = purrr::pluck(laureate, "prizes", .default = NULL))
+  if (is.null(prizes_arr) || length(prizes_arr) == 0) return(tibble())
+  purrr::map_dfr(prizes_arr, function(p) {
+    # Collect all affiliation countries for this prize (v2 shape: affiliations list)
+    affs <- purrr::pluck(p, "affiliations", .default = NULL)
+    aff_countries <- character(0)
+    if (!is.null(affs) && length(affs) > 0) {
+      aff_countries <- purrr::map_chr(affs, function(a) {
+        coalesce_str(safe_pluck_chr(a, "country", "en"),
+                     safe_pluck_chr(a, "country"),
+                     safe_pluck_chr(a, "countryNow", "en"),
+                     safe_pluck_chr(a, "countryNow"))
+      })
+      aff_countries <- aff_countries[nzchar(aff_countries)]
+    }
+    aff_countries_norm <- if (length(aff_countries) > 0) unique(country_normalize(aff_countries)) else character(0)
+
+    tibble(
+      id = laureate_id,
+      awardYear = suppressWarnings(as.integer(coalesce_str(safe_pluck_chr(p, "awardYear"), safe_pluck_chr(p, "year")))),
+      category = coalesce_str(safe_pluck_chr(p, "category", "en"), safe_pluck_chr(p, "category")),
+      categoryFullName = coalesce_str(safe_pluck_chr(p, "categoryFullName", "en"), safe_pluck_chr(p, "categoryFullName")),
+      dateAwarded = coalesce_str(safe_pluck_chr(p, "dateAwarded"), safe_pluck_chr(p, "date")),
+      motivation = coalesce_str(safe_pluck_chr(p, "motivation", "en"), safe_pluck_chr(p, "motivation")),
+      affiliation_countries = list(if (length(aff_countries_norm) > 0) aff_countries_norm else NA_character_)
+    )
+  })
+})
+
+# Join birth info into prizes_df2 so each prize row has birth data
+if ("id" %in% names(prizes_df2) && "id" %in% names(laureates_tidy)) {
+  prizes_df2 <- prizes_df2 %>%
+    mutate(id = as.character(id)) %>%
+    left_join(laureates_tidy %>% select(id, birth_place_country, birth_place_country_norm, birth_date, fullName),
+              by = "id")
+}
+
+# Basic sanity checks
+stopifnot(all(prizes_df2$id %in% laureates_tidy$id))
+message("laureates_tidy rows: ", nrow(laureates_tidy))
+message("prizes_df2 rows: ", nrow(prizes_df2))
+
+# Optionally save processed tibbles for reproducibility
+saveRDS(list(laureates_list = laureates_list,
+             laureates_tidy = laureates_tidy,
+             prizes_df2 = prizes_df2),
+        processed_rds)
+```
+
+Explanatory text for the prepare-data chunk:
+- High-level purpose: transform the nested JSON into two tidy tables that are easy to analyze:
+  - laureates_tidy: one row per laureate containing identifiers, names, birth date, birth place and a normalized birth country column.
+  - prizes_df2: one row per laureate-prize, carrying prize metadata (awardYear, category, dateAwarded, motivation) plus a list-column affiliation_countries that holds all normalized affiliation countries for that prize.
+- Important details:
+  - The code handles both v2 (nobelPrizes per laureate) and legacy v1 shapes (prizes) by plucking either field given availability.
+  - Affiliation collection: for each prize entry we extract every affiliation's country field we can find, strip empties, normalize values using country_normalize(), and store the result as a list. This preserves all affiliation information for downstream logic (e.g., the "lost laureates" test).
+  - Sanity checks: a basic stopifnot ensures that all prize rows have a matching laureate id.
+- Expected outputs:
+  - Informational messages with counts of rows in laureates_tidy and prizes_df2.
+  - laureates_tidy and prizes_df2 available for interactive inspection (use head() or glimpse() as needed).
+
+---
+
+# Methods note — definition used for "lost laureates"
+
+Methods explanation (concise):
+- Operational definition used in analyses:
+  - A laureate is considered "lost" by a birth country X if the laureate's normalized birth country is X AND at least one of the laureate's prize entries lists an affiliation country that is non-NA and not equal to X.
+  - If a prize lists multiple affiliation countries, any differing country triggers the "lost" condition for that prize.
+  - Prizes with no recorded affiliation countries are ignored for the "lost" test.
+- Rationale: this approach uses affiliation information (institutional country at time of award) to approximate the country under which the laureate was awarded, and compares it to the birthplace to identify transfers of affiliation.
+
+---
+
+# Q1 — Top 10 birth countries by number of laureates
+
+```{r q1-top-birth-countries}
+q1 <- laureates_tidy %>%
+  filter(!is.na(birth_place_country_norm) & nzchar(birth_place_country_norm)) %>%
+  group_by(birth_place_country_norm) %>%
+  summarise(laureate_count = n_distinct(id), .groups = "drop") %>%
+  arrange(desc(laureate_count)) %>%
+  slice_head(n = 10)
+
+kable(q1, caption = "Top 10 birth countries by number of laureates (normalized)")
+```
+
+Explanation for Q1 block:
+- What it computes: counts unique laureates (by id) grouped by normalized birth country; returns the top 10.
+- Why this is useful: identifies countries that produced the most Nobel laureates by birthplace, providing a simple geographic view of laureate origins.
+- Expected output: a 10-row table with normalized country names and the number of distinct laureates born there.
+
+---
+
+# Q2 — Top 10 birth countries that "lost" the most laureates
+
+```{r q2-lost-laureates}
+# Helper to decide if affiliation list differs from birth country (vectorized via rowwise)
+compare_affiliations <- function(aff_list, birth_norm) {
+  if (is.null(aff_list) || (length(aff_list) == 1 && (is.na(aff_list) || aff_list == ""))) return(FALSE)
+  affs <- aff_list
+  affs <- affs[!is.na(affs)]
+  if (length(affs) == 0) return(FALSE)
+  any(affs != birth_norm)
+}
+ 
+# Compute per-prize aff_diff, then per-laureate any_affil_diff
+laureate_aff_flags <- prizes_df2 %>%
+  mutate(birth_place_country_norm = as.character(birth_place_country_norm)) %>%
+  rowwise() %>%
+  mutate(aff_diff = compare_affiliations(affiliation_countries[[1]], birth_place_country_norm)) %>%
+  ungroup() %>%
+  group_by(id, birth_place_country_norm) %>%
+  summarise(any_affil_diff = any(aff_diff, na.rm = TRUE), .groups = "drop") %>%
+  filter(any_affil_diff)
+
+q2 <- laureate_aff_flags %>%
+  group_by(birth_place_country_norm) %>%
+  summarise(lost_laureates = n_distinct(id), .groups = "drop") %>%
+  arrange(desc(lost_laureates)) %>%
+  slice_head(n = 10)
+
+kable(q2, caption = "Top 10 birth countries that 'lost' the most laureates (born in X, awarded with different affiliation-country)")
+```
+
+Explanation for Q2 block:
+- What it computes:
+  - For each prize row, compare the list of affiliation_countries (normalized) to the laureate's normalized birth country.
+  - Flag a prize as different if any affiliation country is different from the birth country.
+  - At the laureate level, if any of that person's prizes is flagged, mark the laureate as "lost".
+  - Aggregate by birth country to count how many unique laureates born in that country were flagged as "lost".
+- Implementation notes:
+  - compare_affiliations() handles NA and empty lists gracefully.
+  - The code uses rowwise() to evaluate the list-column per row, then aggregates.
+- Expected output: a table of the top 10 birth countries with counts of laureates born there who were awarded with at least one non-matching affiliation country.
+
+---
+
+# Q3 — Top 10 award years by number of laureates
+
+```{r q3-years-most-laureates}
+q3 <- prizes_df2 %>%
+  filter(!is.na(awardYear)) %>%
+  group_by(awardYear) %>%
+  summarise(laureates_in_year = n_distinct(id), .groups = "drop") %>%
+  arrange(desc(laureates_in_year)) %>%
+  slice_head(n = 10)
+
+kable(q3, caption = "Top 10 award years by number of laureates (distinct persons awarded that year)")
+```
+
+Explanation for Q3 block:
+- What it computes: number of distinct laureates who received prizes in each awardYear; selects the top 10 years.
+- Why: shows which years had the largest number of awarded individuals (useful to spot years with many split prizes or other anomalies).
+- Expected output: year and count of unique laureates for the top 10 award years.
+
+---
+
+# Q4 — Age at award: medians by category + distribution (boxplot)
+
+```{r q4-age-calculation, fig.width=9, fig.height=5}
+# Count how many laureates have missing birth_date (informative)
+missing_births <- sum(is.na(laureates_tidy$birth_date) | !nzchar(as.character(laureates_tidy$birth_date)))
+message("Number of laureates with missing birth_date (will be excluded from age calculations): ", missing_births)
+
+prizes_age <- prizes_df2 %>%
+  filter(!is.na(birth_date) & nzchar(birth_date), !is.na(awardYear)) %>%
+  mutate(
+    birth_date_ymd = suppressWarnings(ymd(birth_date)), # partial dates -> NA
+    # clean dateAwarded column: treat empty string as NA
+    dateAwarded_clean = ifelse(is.na(dateAwarded) | !nzchar(as.character(dateAwarded)), NA_character_, as.character(dateAwarded)),
+    award_date_str = coalesce(dateAwarded_clean, paste0(as.character(awardYear), "-12-10")),
+    award_date_ymd = suppressWarnings(ymd(award_date_str)),
+    age_at_award = as.numeric(difftime(award_date_ymd, birth_date_ymd, units = "days")) / 365.25
+  ) %>%
+  # sanity filters to remove impossible / missing ages
+  filter(!is.na(age_at_award) & age_at_award > 0 & age_at_award < 120)
+
+age_by_category <- prizes_age %>%
+  group_by(category) %>%
+  summarise(
+    n = n(),
+    median_age = median(age_at_award, na.rm = TRUE),
+    mean_age = mean(age_at_award, na.rm = TRUE),
+    sd_age = sd(age_at_award, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(median_age))
+
+kable(age_by_category, digits = 1, caption = "Age at award by category (median, mean, sd)")
+
+# Boxplot with caption and note about partial dates
+ggplot(prizes_age, aes(x = reorder(category, age_at_award, FUN = median), y = age_at_award)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.size = 0.8) +
+  coord_flip() +
+  labs(title = "Distribution of ages at award by Nobel Prize category",
+       x = "Category",
+       y = "Age at award (years)",
+       caption = "Dates: dateAwarded when present; else Dec 10 of award year. Partial/invalid birth dates excluded.") +
+  theme_minimal()
+```
+
+Thorough explanation for Q4 block:
+- Purpose: calculate the age of each laureate at the time of award and summarize by prize category.
+- Steps:
+  1. Count and report how many laureates lack a usable birth_date (those will be excluded from age calculations).
+  2. For prize rows with birth_date and awardYear, parse dates safely (ymd); partial or invalid birth dates become NA and are excluded.
+  3. Use dateAwarded when present; otherwise fall back to December 10 of awardYear (the typical Nobel award date).
+  4. Compute age in years as (award_date - birth_date) / 365.25 and filter out nonsensical ages (<=0 or >120).
+  5. Aggregate by category to compute n, median, mean, and sd of ages.
+  6. Produce a boxplot to visualize the distribution of ages per category (with a caption describing date assumptions).
+- Expected outputs:
+  - A table with counts and summary statistics per category (median, mean, sd).
+  - A horizontal boxplot showing age distributions; the caption documents assumptions about dates.
+- Notes on partial dates: partial birth dates are excluded rather than imputed; if an imputation policy is preferred it can be implemented and documented explicitly.
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
